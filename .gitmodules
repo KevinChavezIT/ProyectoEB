@@ -1,0 +1,3 @@
+[submodule "ecobot"]
+	path = ecobot
+	url = https://github.com/KevinChavezIT/ProyectoEB.git
