@@ -1,0 +1,574 @@
+ 1 using Azure.Core;
+ 2 using Microsoft.Extensions.Configuration;
+ 3 using Newtonsoft.Json;
+ 4 using OfficeOpenXml;
+ 5 using ReporteCoberturaSLA.DAL;
+ 6 using ReporteCoberturaSLA.Models.Cmdb;
+ 7 using ReporteCoberturaSLA.Models.Config;
+ 8 using ReporteCoberturaSLA.Models.EntityModels;
+ 9 using System;
+10 using System.Collections.Concurrent;
+11 using System.Net.Http.Headers;
+12 using System.Text;
+13 using System.Text.RegularExpressions;
+14 using System.Threading;
+15 using static System.Runtime.InteropServices.JavaScript.JSType;
+
+17 namespace ReporteCoberturaSLA
+18 {
+19     class Program
+20     {
+21         private static string _connectionString = string.Empty;
+22         private static ApiCmdSettings _apiSettings = new ApiCmdSettings();
+23         private static List<ServerWithEntities> _serversWithEntities = new List<ServerWithEntities>();
+24         private static List<Server> _serversNoMatch = new List<Server>();
+25         private static List<EntitySchema> _entitySchemaDyn = new List<EntitySchema>();
+26 
+27         public static async Task Main(string[] args)
+28         {
+29             ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+30             LoadConfig();
+
+31             Console.WriteLine("Obteniendo lista de servidores de la cmdb");
+32             var serverList = await GetCmdbServersList();
+33             Console.WriteLine($"Se encontraron {serverList.Count} servidores en la cmdb");
+
+34             Console.WriteLine("Realizando cruce de datos para generación de reporte");
+35             await MatchEntitiesInfo(serverList);
+36             Console.WriteLine($"Se han detectado {_serversWithEntities.Count} entidades monitoreadas por Dynatrace y registradas en la CMDB");
+
+37             GenerateReport();
+38         }
+
+39         public static void LoadConfig()
+40         {
+41             var configuration = new ConfigurationBuilder()
+42                 .SetBasePath(AppDomain.CurrentDomain.BaseDirectory)
+43                 .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+44                 .Build();
+
+45             _connectionString = configuration.GetConnectionString("Connection");
+46             configuration.GetSection("ApiCmdDb").Bind(_apiSettings);
+47         }
+
+48         public static async Task<List<Server>> GetCmdbServersList()
+49         {
+50             using var httpClient = new HttpClient()
+51             {
+52                 Timeout = TimeSpan.FromMinutes(5) // ahora espera hasta 5 minutos
+53             };
+
+54             int maxRetries = 3;   // número de reintentos
+55             int delaySeconds = 5; // espera entre intentos
+56             for (int intento = 1; intento <= maxRetries; intento++)
+57             {
+58                 try
+59                 {
+60                     var byteArray = Encoding.ASCII.GetBytes($"{_apiSettings.User}:{_apiSettings.Password}");
+61                     httpClient.DefaultRequestHeaders.Authorization =
+62                         new AuthenticationHeaderValue("Basic", Convert.ToBase64String(byteArray));
+63                     httpClient.DefaultRequestHeaders.Clear();
+64                     httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+65                     Console.WriteLine($"Intento {intento} de {maxRetries} para obtener la lista de servidores CMDB...");
+
+66                     HttpResponseMessage response = await httpClient.GetAsync(_apiSettings.Url);
+
+67                     if (response.IsSuccessStatusCode)
+68                     {
+69                         string responseBody = await response.Content.ReadAsStringAsync();
+70                         var apiResponse = JsonConvert.DeserializeObject<CmdbResponse>(responseBody);
+71                         var serverList = apiResponse?.Result ?? new List<Server>();
+
+72                         // ✅ Eliminar duplicados por Name
+73                         var uniqueServerList = serverList
+74                             .GroupBy(s => s.Name)
+75                             .Select(g => g.First())
+76                             .ToList();
+
+77                         return uniqueServerList;
+78                     }
+79                     else
+80                     {
+81                         Console.WriteLine($"✘ Error HTTP {response.StatusCode} en intento {intento}");
+82                     }
+83                 }
+84                 catch (Exception ex)
+85                 {
+86                     Console.WriteLine($"⚠️ Error en intento {intento}: {ex.Message}");
+87                     await Task.Delay(delaySeconds * 1000);
+88                 }
+89             }
+90                 catch (TaskCanceledException ex)
+91                 {
+92                     Console.WriteLine($"⏰ Timeout en intento {intento}: {ex.Message}");
+93                     if (intento == maxRetries) throw;
+94                 }
+95                 catch (Exception ex)
+96                 {
+97                     Console.WriteLine($"✘ Error en intento {intento}: {ex.Message}");
+98                     if (intento == maxRetries) throw;
+99                 }
+
+100                 // Espera antes de reintentar
+101                 Console.WriteLine($"⏳ Esperando {delaySeconds} segundos antes del reintento...");
+102                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+103             }
+
+104             return new List<Server>(); // si todo falla, retorna lista vacía
+105         }
+
+106         public static async Task MatchEntitiesInfo(List<Server> serverList)
+107         {
+108             EntitiesDB entitiesDB = new EntitiesDB(_connectionString);
+109             var entitiesList = await entitiesDB.GetEntities();
+
+110             var normalizedEntities = new ConcurrentDictionary<string, List<EntitySchema>>();
+
+111             foreach (var kvp in entitiesList)
+112             {
+113                 var keyHostname = kvp.Key.Split('.')[0].Trim().ToUpper();
+114                 normalizedEntities.TryAdd(keyHostname, kvp.Value);
+115             }
+
+116             Parallel.ForEach(serverList, server =>
+117             {
+118                 if (!string.IsNullOrEmpty(server.Name))
+119                 {
+120                     string hostname = server.Name.Trim().ToUpper();
+121                     bool matchFound = false;
+
+122                     if (normalizedEntities.TryGetValue(hostname, out var matchedEntities))
+123                     {
+124                         _serversWithEntities.Add(new ServerWithEntities
+125                         {
+126                             Server = server,
+127                             Entities = matchedEntities
+128                         });
+129                         matchFound = true;
+130                     }
+131                     if (matchFound)
+132                     {
+133                         normalizedEntities.TryRemove(hostname, out _);
+134                         matchFound = true;
+135                     }
+
+136                     if (!matchFound)
+137                     {
+138                         _serversNoMatch.Add(server);
+139                     }
+
+140                     Console.WriteLine($"Procesando servidores: {serverList.IndexOf(server) + 1}/{serverList.Count}");
+141                 }
+142             });
+
+143             foreach (var remainingEntities in normalizedEntities.Values)
+144             {
+145                 foreach (var entity in remainingEntities)
+146                 {
+147                     _serversNoMatchDyn.Add(entity);
+148                 }
+149             }
+
+150             _serversNoMatchDyn = _serversNoMatchDyn
+151                 .Where(entity => entity.ManagementZones != null &&
+152                                  entity.ManagementZones.Any(zone => zone.Name != null &&
+153                                      zone.Name.IndexOf("Premise", StringComparison.OrdinalIgnoreCase) >= 0))
+154                 .ToList();
+155             Console.WriteLine($"✅ Entidades con match {_serversWithEntities.Count}");
+156             Console.WriteLine($"⚠️ Entidades que no hicieron match en cmdb {_serversNoMatch.Count}");
+157             Console.WriteLine($"❌ Entidades que no hicieron match en dynatrace {_serversNoMatchDyn.Count}");
+158         }
+
+159         public static void GenerateReport()
+160         {
+161             ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+162             using var package = new ExcelPackage();
+
+163             CreateMonitoredSheet(package);
+164             CreateNoMatchCmdbServerSheet(package);
+165             CreateNoMatchDynatraceServerSheet(package);
+
+166             var slaSheet = package.Workbook.Worksheets.Add("Calculo SLA");
+167             slaSheet.Cells["A1"].Value = "Métrica";
+168             slaSheet.Cells["B1"].Value = "Valor";
+169             slaSheet.Cells["A1:B1"].Style.Font.Bold = true;
+170             var fileInfo = new FileInfo("servers_with_entities.xlsx");
+171             package.SaveAs(fileInfo);
+172             Console.WriteLine("Excel file 'servers_with_entities.xlsx' has been created successfully.");
+173         }
+
+174         // Condición para hacer el match con los Inventario Monitoreados
+175         private static string NormalizeHost(string name)
+176         {
+177             if (String.IsNullOrWhiteSpace(name)) return string.Empty;
+
+178             name = name.Trim();
+
+179             // Quitar dominio, si viene: HOST.DOMINIO.COM → HOST
+180             int dot = name.IndexOf('.');
+181             if (dot > 0) name = name[..dot];
+182             return name.ToUpperInvariant();
+183         }
+
+184         private static HashSet<string> LoadInventoryHostnames(string inventoryPath, string sheetName = "Hoja1")
+185         {
+186             var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+187             using var inv = new ExcelPackage(new FileInfo(inventoryPath));
+188             var ws = inv.Workbook.Worksheets[sheetName];
+189             if (ws == null) return set;
+
+190             int r = 2; // A1 = encabezado HOSTNAME
+191             while (true)
+192             {
+193                 var raw = ws.Cells[r, 1].Text;
+194                 if (string.IsNullOrWhiteSpace(raw)) break;
+195                 set.Add(NormalizeHost(raw));
+196                 r++;
+197             }
+198             return set;
+199         }
+
+200         // Sistema Operativo–Versión
+201         private static string NormalizeSoVersion(string s)
+202         {
+203             if (string.IsNullOrWhiteSpace(s)) return string.Empty;
+204             s = s.Trim().ToUpperInvariant(); // Todo en mayúscula
+
+205             // Unificar guiones y espacios
+206             s = s.Replace("--", "-").Replace(" -", "-").Replace("- ", "-")
+207                  .Replace("  ", " ").Replace("_", "-");
+
+208             // Quitar caracteres raros, dejar solo letras, números, guiones, puntos y espacios
+209             var sb = new System.Text.StringBuilder();
+210             foreach (char c in s)
+211             {
+212                 if (char.IsLetterOrDigit(c) || c == '-' || c == '.' || c == ' ')
+213                     sb.Append(c);
+214             }
+215             return sb.ToString().Trim();
+216         }
+217             s = sb.ToString();
+
+218             // Quitar dobles espacios
+219             while (s.Contains("  ")) s = s.Replace("  ", " ");
+
+220             return s.Trim();
+221         }
+
+222         // Carga un diccionario: Clave = "Sistema Operativo–Versión" normalizado, valor = "SI"/"NO"/"VERIFICAR"
+223         private static Dictionary<string, string> LoadPolicyBySo(string path, string sheet = "Hoja1")
+224         {
+225             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+226             using var pkg = new OfficeOpenXml.ExcelPackage(new FileInfo(path));
+227             var ws = pkg.Workbook.Worksheets[sheet];
+228             if (ws == null) return map;
+
+229             int r = 2; // Empieza en la fila 2 (A: SO–Versión, B: SI/NO/VERIFICAR)
+230             while (true)
+231             {
+232                 var raw = ws.Cells[r, 1].Text;
+233                 if (string.IsNullOrWhiteSpace(raw)) break;
+
+234                 var val = ws.Cells[r, 2].Text?.Trim().ToUpperInvariant();
+235                 if (string.IsNullOrWhiteSpace(val)) val = "VERIFICAR";
+236                 var norm = NormalizeSoVersion(raw);
+237                 if (!map.ContainsKey(norm))
+238                     map[norm] = val;
+
+239                 r++;
+240             }
+241             return map;
+242         }
+
+243         // Lee un Excel de catálogo con columnas: A = HostName, B = Estado operativo (Operativo/Retirado/...)
+244         private static Dictionary<string, string> LoadOperationalStatus(string path, string sheet = "Hoja1")
+245         {
+246             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+247             using var pkg = new OfficeOpenXml.ExcelPackage(new FileInfo(path));
+248             var ws = pkg.Workbook.Worksheets[sheet];
+249             if (ws == null) return map;
+
+250             int r = 2; // encabezados en fila 1
+251             while (true)
+252             {
+253                 var rawName = ws.Cells[r, 1].Text; // HostName
+254                 if (string.IsNullOrWhiteSpace(rawName)) break;
+255                 var status = ws.Cells[r, 2].Text?.Trim();
+256                 if (string.IsNullOrWhiteSpace(status)) status = "SIN DATO";
+
+257                 var key = NormalizeHost(rawName);
+258                 if (!map.ContainsKey(key))
+259                     map[key] = status;
+
+260                 r++;
+261             }
+262             return map;
+263         }
+
+264         public static void CreateMonitoredSheet(ExcelPackage package)
+265         {
+266             var worksheet = package.Workbook.Worksheets.Add("Monitoreados");
+
+267             var headers = new[]
+268             {
+269                 "Server Name", "Server Class", "Server Group",
+270                 "Tenant", "Environment", "Entity Id", "Type",
+271                 "Display Name", "First Seen", "Last Seen",
+272                 "Installer Tracked Download", "Physical Memory",
+273                 "Standalone", "Standalone Special AgentsOnly",
+275                 "Cpu Cores", "Memory Total", "Installer Support Alert",
+276                 "Ip Address", "Management Zones", "Tags Value", "Os Type",
+277                 "Tags Key", "Tags String Representation", "HypervisorType",
+278                 "Bitness", "Os Architecture", "Os Version", "Installer Version",
+279                 "Network Zone", "Auto Injection", "Monitoring Mode", "Host Group Name",
+280                 "Gestionado Por", "Es Virtual", "Sistema Operativo–Versión",
+281                 "Operational State", "Inventario Torres",
+282                 "Aplica Monitoreo por SO", "Aplica por Nombre", "Estado Operativo (Catálogo)"
+283             };
+
+284             for (int i = 0; i < headers.Length; i++)
+285             {
+286                 worksheet.Cells[1, i + 1].Value = headers[i];
+287                 worksheet.Cells[1, i + 1].Style.Font.Bold = true;
+288             }
+
+289             // ==== CARGAR INVENTARIO TORRES ====
+290             string inventoryPath = Path.Combine(AppContext.BaseDirectory, "Inventario Torres Consolidado.xlsx");
+291             var inventoryHostnames = LoadInventoryHostnames(inventoryPath, "Hoja1");
+
+292             // ==== CARGAR INVENTARIO SISTEMA OPERATIVO ====
+293             string policyPath = Path.Combine(AppContext.BaseDirectory, "Sistema Operativo Monitoreo.xlsx");
+294             var soPolicy = LoadPolicyBySo(policyPath, "Hoja1");
+
+295             // ==== CARGAR ESTADO OPERATIVO CMDB ====
+296             string opStatusPath = Path.Combine(AppContext.BaseDirectory, "Servidores CMDB.xlsx");
+297             var opStatus = LoadOperationalStatus(opStatusPath, "Hoja1");
+
+298             int row = 2;
+
+299             foreach (var serverWithEntities in _serversWithEntities)
+300             {
+301                 var server = serverWithEntities.Server;
+302                 var latest = serverWithEntities.Entities.OrderByDescending(e => e.LastSeen).FirstOrDefault();
+303                 var serverNameUpper = NormalizeHost(server?.Name ?? string.Empty);
+
+304                 string estado;
+305                 if (!opStatus.TryGetValue(serverNameUpper, out estado))
+306                     estado = "SIN DATO";
+
+307                 worksheet.Cells[row, 1].Value = serverNameUpper;
+308                 worksheet.Cells[row, 2].Value = server.Class;
+309                 worksheet.Cells[row, 3].Value = server.Group;
+310                 worksheet.Cells[row, 4].Value = server.Tenant;
+311                 worksheet.Cells[row, 5].Value = server.Environment;
+312                 worksheet.Cells[row, 6].Value = latest?.EntityId;
+313                 worksheet.Cells[row, 7].Value = latest?.Type;
+314                 worksheet.Cells[row, 8].Value = latest?.DisplayName;
+315                 worksheet.Cells[row, 9].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+316                 worksheet.Cells[row, 9].Value = latest?.FirstSeen;
+317                 worksheet.Cells[row, 10].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+318                 worksheet.Cells[row, 10].Value = latest?.LastSeen;
+319                 worksheet.Cells[row, 11].Value = latest?.Properties?.InstallerTrackedDownload ?? "Falso";
+320                 worksheet.Cells[row, 12].Value = latest?.Properties?.PhysicalMemory?.ToString() ?? "";
+321                 worksheet.Cells[row, 13].Value = latest?.Properties?.Standalone ?? "Falso";
+322                 worksheet.Cells[row, 14].Value = latest?.Properties?.StandaloneSpecialAgentsOnly ?? "Falso";
+323                 worksheet.Cells[row, 15].Value = latest?.Properties?.LogicalCpuCores?.ToString() ?? "";
+324                 worksheet.Cells[row, 16].Value = latest?.Properties?.MemoryTotal?.ToString() ?? "";
+325                 worksheet.Cells[row, 17].Value = latest?.Properties?.InstallerSupportAlert ?? "Falso";
+326                 worksheet.Cells[row, 18].Value = latest?.Properties?.IpAddress ?? "";
+327                 worksheet.Cells[row, 19].Value = latest?.Properties?.ManagementZones ?? new List<string>();
+328                 worksheet.Cells[row, 20].Value = string.Join(",", latest?.Tags?.Where(t => t.Name != null).Select(t => t.Name) ?? new List<string>());
+329                 worksheet.Cells[row, 21].Value = string.Join(",", latest?.Tags?.Where(t => t.Key != null).Select(t => t.Key) ?? new List<string>());
+330                 worksheet.Cells[row, 22].Value = string.Join(",", latest?.Tags?.Where(t => t.StringRepresentation != null).Select(t => t.StringRepresentation) ?? new List<string>());
+331                 worksheet.Cells[row, 23].Value = string.Join(",", latest?.Tags?.Where(t => t.Value != null).Select(t => t.Value) ?? new List<string>());
+332                 worksheet.Cells[row, 24].Value = string.Join(",", latest?.Tags?.Where(t => t.Key != null).Select(t => t.Key) ?? new List<string>());
+333                 worksheet.Cells[row, 25].Value = string.Join(",", latest?.Tags?.Where(t => t.StringRepresentation != null).Select(t => t.StringRepresentation) ?? new List<string>());
+334                 worksheet.Cells[row, 26].Value = string.Join(",", latest?.Tags?.Where(t => t.Value != null).Select(t => t.Value) ?? new List<string>());
+335                 worksheet.Cells[row, 27].Value = latest?.OsType ?? "";
+336                 worksheet.Cells[row, 28].Value = latest?.DetectedName ?? "";
+337                 worksheet.Cells[row, 29].Value = latest?.State ?? "";
+338                 worksheet.Cells[row, 30].Value = latest?.OneAgentCustomHostName ?? "";
+339                 worksheet.Cells[row, 31].Value = latest?.HypervisorType ?? "";
+340                 worksheet.Cells[row, 32].Value = latest?.Bitness ?? "";
+341                 worksheet.Cells[row, 33].Value = latest?.OsArchitecture ?? "";
+342                 worksheet.Cells[row, 34].Value = latest?.OsVersion ?? "";
+343                 worksheet.Cells[row, 35].Value = latest?.InstallVersion ?? "";
+344                 worksheet.Cells[row, 36].Value = latest?.NetworkZone ?? "";
+345                 worksheet.Cells[row, 37].Value = latest?.AutoInjection ?? "";
+346                 worksheet.Cells[row, 38].Value = latest?.MonitoringMode ?? "";
+347                 worksheet.Cells[row, 39].Value = latest?.HostGroupName ?? "";
+348                 worksheet.Cells[row, 40].Value = server.Virtual ?? "";
+
+349                 // Unión sistema operativo y versión
+350                 string osv = (latest?.Properties?.OsVersion ?? "").Trim();
+351                 string iv = (latest?.Properties?.InstallVersion ?? "").Trim();
+352                 string soVersion = string.Join(" ", new[] { osv, iv }.Where(s => !string.IsNullOrWhiteSpace(s)));
+353                 worksheet.Cells[row, 41].Value = soVersion;
+354                 // Fin unión sistema operativo y versión
+355                 worksheet.Cells[row, 42].Value = server.OperationalState;
+
+356                 bool exists = inventoryHostnames.Contains(serverNameUpper);
+357                 worksheet.Cells[row, 43].Value = exists ? "SI" : "NO";
+
+358                 // Sistema Operativo Monitoreo
+359                 string soKey = NormalizeSoVersion(soVersion);
+360                 if (!soPolicy.TryGetValue(soKey, out var applies))
+361                     applies = "VERIFICAR";
+
+362                 worksheet.Cells[row, 44].Value = applies;
+
+363                 // Columna Aplica por Nombre
+364                 string serverName = (server.Name ?? "").Trim().ToUpperInvariant();
+365                 string aplicaNombre;
+366                 if (serverName.StartsWith("POE") ||
+367                     serverName.StartsWith("CLON_POE") ||
+368                     serverName.StartsWith("TEMPLATE"))
+369                 {
+370                     aplicaNombre = "NO";
+371                 }
+372                 else
+373                 {
+374                     aplicaNombre = "SI";
+375                 }
+
+376                 worksheet.Cells[row, 45].Value = aplicaNombre;
+
+377                 // Sistema Operativo
+378                 worksheet.Cells[row, 46].Value = estado;
+
+379                 row++;
+380             }
+381         }
+
+382         public static void CreateNoMatchCmdbServerSheet(ExcelPackage package)
+383         {
+384             var worksheet = package.Workbook.Worksheets.Add("No Monitoreados Cmdb");
+
+385             var headers = new[]
+386             {
+387                 "Server Name", "Server Class", "Server Group", "Operational State",
+388                 "Environment", "Related Application", "Owned By", "Manufacturer",
+389                 "Sistema Operativo", "Versión Sistema Operativo", "Es Virtual",
+390                 "Sistema Operativo–Versión", "Inventario Torres", "Aplica Monitoreo por SO",
+391                 "Aplica por Nombre"
+392             };
+
+393             for (int i = 0; i < headers.Length; i++)
+394             {
+395                 worksheet.Cells[1, i + 1].Value = headers[i];
+396                 worksheet.Cells[1, i + 1].Style.Font.Bold = true;
+397             }
+
+398             // ==== CARGAR INVENTARIO TORRES ====
+399             string inventoryPath = Path.Combine(AppContext.BaseDirectory, "Inventario Torres Consolidado.xlsx");
+400             var inventoryHostnames = LoadInventoryHostnames(inventoryPath, "Hoja1");
+
+401             // ==== CARGAR INVENTARIO SISTEMA OPERATIVO ====
+402             string policyPath = Path.Combine(AppContext.BaseDirectory, "Sistema Operativo Monitoreo.xlsx");
+403             var soPolicy = LoadPolicyBySo(policyPath, "Hoja1");
+
+404             // ==== CARGAR ESTADO OPERATIVO CMDB ====
+405             string opStatusPath = Path.Combine(AppContext.BaseDirectory, "Servidores CMDB.xlsx");
+406             var opStatus = LoadOperationalStatus(opStatusPath, "Hoja1");
+407             int rowIndex = 2;
+
+408             foreach (var server in _serversNoMatch)
+409             {
+410                 var serverNameUpperNoMoni = (server?.Name ?? string.Empty).ToUpperInvariant();
+
+411                 string estado2;
+412                 if (!opStatus.TryGetValue(serverNameUpperNoMoni, out estado2))
+413                     estado2 = "SIN DATO";
+
+414                 worksheet.Cells[rowIndex, 1].Value = serverNameUpperNoMoni;
+415                 worksheet.Cells[rowIndex, 2].Value = server.Class;
+416                 worksheet.Cells[rowIndex, 3].Value = server.Group;
+417                 worksheet.Cells[rowIndex, 4].Value = server.OperationalState;
+418                 worksheet.Cells[rowIndex, 5].Value = server.Environment;
+419                 worksheet.Cells[rowIndex, 6].Value = server.RelatedApplication;
+420                 worksheet.Cells[rowIndex, 7].Value = server.OwnedBy;
+421                 worksheet.Cells[rowIndex, 8].Value = server.Manufacturer;
+422                 worksheet.Cells[rowIndex, 9].Value = server.SistemaOperativo;
+423                 worksheet.Cells[rowIndex, 10].Value = server.VersionSistemaOperativo;
+424                 worksheet.Cells[rowIndex, 11].Value = server.Managed;
+425                 worksheet.Cells[rowIndex, 12].Value = server.Virtual;
+
+426                 // Unión Sistema Operativo - Versión
+427                 var soFull = $"{server.SistemaOperativo}-{server.VersionSistemaOperativo}".Trim('-');
+428                 worksheet.Cells[rowIndex, 13].Value = soFull;
+
+429                 bool exists = inventoryHostnames.Contains(serverNameUpperNoMoni);
+430                 worksheet.Cells[rowIndex, 14].Value = exists ? "SI" : "NO";
+
+431                 string soKey = NormalizeSoVersion(soFull);
+432                 if (!soPolicy.TryGetValue(soKey, out var applies))
+433                     applies = "VERIFICAR";
+434                 worksheet.Cells[rowIndex, 15].Value = applies;
+435                 // Columna Aplica por Nombre
+436                 string serverName = (server.Name ?? "").Trim().ToUpperInvariant();
+437                 string aplicaNombre;
+438                 if (serverName.StartsWith("POE") ||
+439                     serverName.StartsWith("CLON_POE") ||
+440                     serverName.StartsWith("TEMPLATE"))
+441                 {
+442                     aplicaNombre = "NO";
+443                 }
+444                 else
+445                 {
+446                     aplicaNombre = "SI";
+447                 }
+
+448                 worksheet.Cells[rowIndex, 16].Value = aplicaNombre;
+449                 worksheet.Cells[rowIndex, 17].Value = estado2;
+450                 rowIndex++;
+451             }
+452         }
+
+453         public static void CreateNoMatchDynatraceServerSheet(ExcelPackage package)
+454         {
+455             var worksheet = package.Workbook.Worksheets.Add("No Monitoreados Dynatrace");
+
+456             var headers = new[]
+457             {
+458                 "Tenant", "Environment", "Entity Id", "Type",
+459                 "Display Name", "First Seen", "Last Seen",
+460                 "Installer Tracked Download", "Physical Memory",
+461                 "Standalone", "Standalone Special AgentsOnly",
+462                 "Is Monitoring Candidate",
+463                 "Logical Cpu Cores", "Memory Total", "Installer Support Alert",
+464                 "Ip Address", "Management Zones", "Tags Key", "Tags String Representation",
+466             "Tags Value", "Os Type", "Detected Name", "State", "OneAgent Custom Host Name",
+467             "HypervisorType", "Bitness", "Os Architecture", "Os Version", "Installer Version",
+468             "Network Zone", "Auto Injection", "Monitoring Mode", "Host Group Name", "Gestionado Por", "Es Virtual"
+469         };
+
+470         for (int i = 0; i < headers.Length; i++)
+471         {
+472             worksheet.Cells[1, i + 1].Value = headers[i];
+473             worksheet.Cells[1, i + 1].Style.Font.Bold = true;
+474         }
+
+475         int row = 2;
+476         foreach (var entity in _serversNoMatchDyn)
+477         {
+478             worksheet.Cells[row, 1].Value = entity.Tenant;
+479             worksheet.Cells[row, 2].Value = entity.Environment;
+480             worksheet.Cells[row, 3].Value = entity.EntityId;
+481             worksheet.Cells[row, 4].Value = entity.Type;
+482             worksheet.Cells[row, 5].Value = entity.DisplayName;
+483             worksheet.Cells[row, 6].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+484             worksheet.Cells[row, 6].Value = entity.FirstSeen;
+485             worksheet.Cells[row, 7].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+486             worksheet.Cells[row, 7].Value = entity.LastSeen;
+487             worksheet.Cells[row, 8].Value = entity.Properties?.InstallerTrackedDownload ?? (object)DBNull.Value;
+488             worksheet.Cells[row, 9].Value = entity.Properties?.PhysicalMemory ?? (object)DBNull.Value;
+489             worksheet.Cells[row, 10].Value = entity.Properties?.Standalone ?? (object)DBNull.Value;
+490             worksheet.Cells[row, 11].Value = entity.Properties?.StandaloneSpecialAgentsOnly ?? (object)DBNull.Value;
+491             worksheet.Cells[row, 12].Value = entity.Properties?.IsMonitoringCandidate ?? (object)DBNull.Value;
+492             worksheet.Cells[row, 13].Value = entity.Properties?.LogicalCpuCores ?? (object)DBNull.Value;
+493             worksheet.Cells[row, 14].Value = entity.Properties?.MemoryTotal ?? (object)DBNull.Value;
+494             worksheet.Cells[row, 15].Value = entity.Properties?.InstallerSupportAlert ?? (object)DBNull.Value;
+495             worksheet.Cells[row, 16].Value = entity.Properties?.IpAddress ?? new List<string>();
+496             
+        
